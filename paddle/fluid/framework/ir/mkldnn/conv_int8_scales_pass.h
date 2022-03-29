@@ -30,12 +30,10 @@ class Graph;
  */
 class ConvInt8ScalesPass : public FusePassBase {
  public:
-  ConvInt8ScalesPass();
   virtual ~ConvInt8ScalesPass() {}
 
  protected:
   void ApplyImpl(ir::Graph* graph) const override;
-  // const std::string name_scope_{"conv_int8_scales"}; //??
 };
 
 }  // namespace ir

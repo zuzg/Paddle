@@ -224,9 +224,15 @@ class ConvMKLDNNHandlerT
       float activation_scale = 1.0f;
       std::vector<float> output_shift_scale;
       if (platform::is_int8<T>()) {
-        sum_scale = ctx.Attr<float>("Scale_in_eltwise");
-        activation_scale = ctx.Attr<float>("Scale_out");
-        output_shift_scale = ctx.Attr<std::vector<float>>("Scale_weights");
+        if (ctx.HasAttr("Sum_scale")) {
+          sum_scale = ctx.Attr<float>("Sum_scale");
+          activation_scale = ctx.Attr<float>("Activation_scale");
+          output_shift_scale =
+              ctx.Attr<std::vector<float>>("Output_shift_scale");
+        } else {
+          std::tie(sum_scale, output_shift_scale, activation_scale) =
+              get_int8_scales(ctx);
+        }
       }
 
       const dnnl::primitive_attr conv_attr = CreatePostOps(
@@ -394,6 +400,94 @@ class ConvMKLDNNHandlerT
           diff_dst_md, strides, dilations_dims, mkldnn_paddings[0],
           mkldnn_paddings[1]);
     }
+  }
+
+  std::shared_ptr<std::tuple<float, std::vector<float>>> get_int8_bias_scales(
+      const framework::ExecutionContext& ctx) {
+    // Get scales int8 bias key
+    const std::string key_bs = this->key_ + "@bs";
+
+    // Scales for int8 bias are to be cached to avoid
+    // computing them each iteration
+    auto bias_scale_tuple =
+        std::static_pointer_cast<std::tuple<float, std::vector<float>>>(
+            this->dev_ctx_.GetBlob(key_bs));
+    if (bias_scale_tuple) return bias_scale_tuple;
+
+    const auto* filter = ctx.Input<Tensor>("Filter");
+    const auto& weights_tz = phi::vectorize(filter->dims());
+    const int groups = std::max(ctx.Attr<int>("groups"), 1);
+
+    const auto& scale_weights_data =
+        ctx.Attr<std::vector<float>>("Scale_weights");
+    const auto& scale_in_data = ctx.Attr<float>("Scale_in");
+
+    bool is_multi_channel = scale_weights_data.size() > 1;
+    int mask_reorder = is_multi_channel ? 1 << 0 : 1;
+
+    int count = 1;
+    if (is_multi_channel) {
+      count *= weights_tz[0];
+      if (groups > 1) {
+        count *= weights_tz[1];
+      }
+    }
+
+    bias_scale_tuple =
+        std::make_shared<std::tuple<float, std::vector<float>>>(std::make_tuple(
+            static_cast<float>(mask_reorder), std::vector<float>(count)));
+    for (int i = 0; i < count; i++) {
+      std::get<1>(*bias_scale_tuple)[i] = scale_in_data * scale_weights_data[i];
+    }
+
+    this->dev_ctx_.SetBlob(key_bs, bias_scale_tuple);
+
+    return bias_scale_tuple;
+  }
+
+  std::tuple<float, std::vector<float>, float> get_int8_scales(
+      const framework::ExecutionContext& ctx) const {
+    const auto* filter = ctx.Input<Tensor>("Filter");
+    const auto& weights_tz = phi::vectorize(filter->dims());
+
+    const bool& force_fp32_output = ctx.Attr<bool>("force_fp32_output");
+    const bool& fuse_residual_conn = ctx.Attr<bool>("fuse_residual_connection");
+    const int groups = std::max(ctx.Attr<int>("groups"), 1);
+
+    const auto& scale_in_data = ctx.Attr<float>("Scale_in");
+    const auto& scale_in_eltwise_data = ctx.Attr<float>("Scale_in_eltwise");
+    auto scale_weights_data = ctx.Attr<std::vector<float>>("Scale_weights");
+    bool is_multi_channel = scale_weights_data.size() > 1;
+    bool has_activation = !ctx.Attr<std::string>("fuse_activation").empty();
+    float activation_scale =
+        force_fp32_output ? 1.0f : has_activation ? ctx.Attr<float>("Scale_out")
+                                                  : 1.0f;
+    auto scale_out_data =
+        force_fp32_output ? 1.0f : has_activation
+                                       ? 1.0f
+                                       : ctx.Attr<float>("Scale_out");
+    float sum_scale =
+        fuse_residual_conn ? scale_out_data / scale_in_eltwise_data : 1.0f;
+    int count =
+        is_multi_channel
+            ? (groups > 1 ? (weights_tz)[1] * (weights_tz)[0] : (weights_tz)[0])
+            : 1;
+    std::vector<float> output_shift_scale(count);
+
+#pragma omp parallel for if (count > 50)
+    for (int i = 0; i < count; i++) {
+      if (scale_weights_data[i] == 0.0)
+        // weights data will contain 0 in some models, then weights
+        // scale couldn't be calculated
+        output_shift_scale[i] = scale_out_data;
+      else
+        output_shift_scale[i] =
+            static_cast<float>(static_cast<double>(scale_out_data) /
+                               (static_cast<double>(scale_in_data) *
+                                static_cast<double>(scale_weights_data[i])));
+    }
+
+    return std::make_tuple(sum_scale, output_shift_scale, activation_scale);
   }
 
   dnnl::primitive_attr CreatePostOps(
@@ -785,27 +879,19 @@ class ConvMKLDNNOpKernel : public framework::OpKernel<T> {
         {DNNL_ARG_WEIGHTS, *weights_memory_p},
         {DNNL_ARG_DST, *dst_memory_p}};
 
-    const auto& scale_in_data = ctx.Attr<float>("Scale_in");
-    const auto& weights_tz = phi::vectorize(filter->dims());
-    int count = 1;
-    if (is_multi_channel) {
-      count *= weights_tz[0];
-      if (groups > 1) {
-        count *= weights_tz[1];
-      }
-    }
     if (bias) {
-      auto p_scales_tuple =
-          std::make_shared<std::tuple<float, std::vector<float>>>(
-              std::make_tuple(static_cast<float>(mask_reorder),
-                              std::vector<float>(count)));
-      for (int i = 0; i < count; i++) {
-        std::get<1>(*p_scales_tuple)[i] = scale_in_data * scale_weights_data[i];
+      if (ctx.HasAttr("Bias_scales")) {
+        auto bias_scales = ctx.Attr<std::vector<float>>("Bias_scales");
+        auto p_scales_tuple =
+            std::make_shared<std::tuple<float, std::vector<float>>>(
+                std::make_tuple(static_cast<float>(mask_reorder), bias_scales));
+      } else {
+        auto p_scales_tuple = handler.get_int8_bias_scales(ctx);
       }
-
+      auto p_scales_tuple = handler.get_int8_bias_scales(ctx);
       auto bias_memory_p = handler.AcquireBiasMemoryWithReorder(
           bias, true, std::get<1>(*p_scales_tuple),
-          static_cast<float>(mask_reorder));
+          std::get<0>(*p_scales_tuple));
       args.insert({DNNL_ARG_BIAS, *bias_memory_p});
     }
 

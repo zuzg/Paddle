@@ -18,54 +18,6 @@ namespace paddle {
 namespace framework {
 namespace ir {
 
-ConvInt8ScalesPass::ConvInt8ScalesPass() {
-  AddOpCompat(OpCompat("conv2d"))
-      .AddInput("Input")
-      .IsTensor()
-      .End()
-      .AddInput("Filter")
-      .IsTensor()
-      .End()
-      .AddInput("Bias")
-      .IsTensor()
-      .End()
-      .AddInput("ResidualData")
-      .IsTensor()
-      .IsOptional()
-      .End()
-      .AddOutput("Output")
-      .IsTensor()
-      .End()
-      .AddAttr("strides")
-      .End()
-      .AddAttr("paddings")
-      .End()
-      .AddAttr("padding_algorithm")
-      .IsOptional()
-      .IsStringIn({"EXPLICIT", "SAME", "VALID"})
-      .End()
-      .AddAttr("groups")
-      .IsNumGE(1)
-      .End()
-      .AddAttr("dilations")
-      .End()
-      .AddAttr("data_format")
-      .IsOptional()
-      .IsStringIn({"NCHW", "NHWC", "AnyLayout"})
-      .End()
-      .AddAttr("Scale_in")
-      .IsType<std::vector<float>>()
-      .End()
-      .AddAttr("Scale_in_eltwise")  // sum scale
-      .IsType<std::vector<float>>()
-      .End()
-      .AddAttr("Scale_weights")  // output shift scale
-      .IsType<std::vector<float>>()
-      .End()
-      .AddAttr("Scale_out")  // acivation scale
-      .IsType<std::vector<float>>()
-      .End();
-}
 void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
   PADDLE_ENFORCE_NOT_NULL(graph,
                           platform::errors::InvalidArgument(
@@ -73,7 +25,6 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
   GraphPatternDetector gpd;
   patterns::Conv conv_pattern(gpd.mutable_pattern(), "conv_int8_scales_pass");
 
-  int found_int8_scales = 0;
   auto handler = [&](const GraphPatternDetector::subgraph_t& subgraph,
                      Graph* g) {
     if (!IsCompat(subgraph, g)) {
@@ -88,11 +39,7 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
     auto input_names = conv_op->Op()->InputNames();
     bool has_bias = std::find(input_names.begin(), input_names.end(), "Bias") !=
                     input_names.end();
-
-    // const auto* filter = conv_op->Op()->Input("Filter"); //find proper way
     std::vector<int64_t> weights_tz = conv_filter->Var()->GetShape();
-
-    // const auto& weights_tz = phi::vectorize(filter->dims());
     const int groups =
         std::max(conv_op->Op()->GetAttrIfExists<int>("groups"), 1);
 
@@ -111,19 +58,15 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
         count *= weights_tz[1];
       }
     }
-    // if(has_bias && conv_op->Op()->Input("Bias").size() > 0) {
-    //   // zapisac w attr
-    //   // tuple attr???
-    //   auto bias_scale_tuple =
-    //     std::make_shared<std::tuple<float,
-    //     std::vector<float>>>(std::make_tuple(
-    //         static_cast<float>(mask_reorder), std::vector<float>(count)));
-    //   for (int i = 0; i < count; i++) {
-    //     std::get<1>(*bias_scale_tuple)[i] = scale_in_data *
-    //     scale_weights_data[i];
-    //   }
-    // }
-    // add to op compat
+
+    if (has_bias && conv_op->Op()->Input("Bias").size() > 0) {
+      auto bias_scales = std::vector<float>(count);
+      for (int i = 0; i < count; i++) {
+        bias_scales[i] = scale_in_data * scale_weights_data[i];
+      }
+      conv_op->Op()->SetAttr("Bias_scales", bias_scales);
+    }
+
     const bool& force_fp32_output =
         conv_op->Op()->GetAttrIfExists<bool>("force_fp32_output");
     const bool& fuse_residual_conn =
@@ -162,9 +105,9 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
                                 static_cast<double>(scale_weights_data[i])));
     }
 
-    conv_op->Op()->SetAttr("Scale_in_eltwise", sum_scale);
-    conv_op->Op()->SetAttr("Scale_weights", output_shift_scale);
-    conv_op->Op()->SetAttr("Scale_out", activation_scale);
+    conv_op->Op()->SetAttr("Sum_scale", sum_scale);
+    conv_op->Op()->SetAttr("Output_shift_scale", output_shift_scale);
+    conv_op->Op()->SetAttr("Activation_scale", activation_scale);
   };
 }
 
