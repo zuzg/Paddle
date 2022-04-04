@@ -880,15 +880,18 @@ class ConvMKLDNNOpKernel : public framework::OpKernel<T> {
         {DNNL_ARG_DST, *dst_memory_p}};
 
     if (bias) {
+      std::vector<float> bias_scales;
+      auto p_scales_tuple =
+          std::make_shared<std::tuple<float, std::vector<float>>>(
+              std::make_tuple(static_cast<float>(mask_reorder), bias_scales));
       if (ctx.HasAttr("Bias_scales")) {
-        auto bias_scales = ctx.Attr<std::vector<float>>("Bias_scales");
-        auto p_scales_tuple =
+        bias_scales = ctx.Attr<std::vector<float>>("Bias_scales");
+        p_scales_tuple =
             std::make_shared<std::tuple<float, std::vector<float>>>(
                 std::make_tuple(static_cast<float>(mask_reorder), bias_scales));
       } else {
-        auto p_scales_tuple = handler.get_int8_bias_scales(ctx);
+        p_scales_tuple = handler.get_int8_bias_scales(ctx);
       }
-      auto p_scales_tuple = handler.get_int8_bias_scales(ctx);
       auto bias_memory_p = handler.AcquireBiasMemoryWithReorder(
           bias, true, std::get<1>(*p_scales_tuple),
           std::get<0>(*p_scales_tuple));

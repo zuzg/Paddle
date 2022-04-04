@@ -22,9 +22,11 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
   PADDLE_ENFORCE_NOT_NULL(graph,
                           platform::errors::InvalidArgument(
                               "Pointer to graph argument should not be NULL."));
+  FusePassBase::Init("conv_int8_scales_pass", graph);
   GraphPatternDetector gpd;
   patterns::Conv conv_pattern(gpd.mutable_pattern(), "conv_int8_scales_pass");
 
+  int found_conv_int8_scales_count = 0;
   auto handler = [&](const GraphPatternDetector::subgraph_t& subgraph,
                      Graph* g) {
     if (!IsCompat(subgraph, g)) {
@@ -49,7 +51,6 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
         conv_op->Op()->GetAttrIfExists<float>("Scale_in");
 
     bool is_multi_channel = scale_weights_data.size() > 1;
-    int mask_reorder = is_multi_channel ? 1 << 0 : 1;
 
     int count = 1;
     if (is_multi_channel) {
@@ -108,7 +109,10 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
     conv_op->Op()->SetAttr("Sum_scale", sum_scale);
     conv_op->Op()->SetAttr("Output_shift_scale", output_shift_scale);
     conv_op->Op()->SetAttr("Activation_scale", activation_scale);
+    found_conv_int8_scales_count++;
   };
+  gpd(graph, handler);
+  AddStatis(found_conv_int8_scales_count);
 }
 
 }  // namespace ir
