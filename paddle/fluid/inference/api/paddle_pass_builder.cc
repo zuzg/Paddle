@@ -282,7 +282,6 @@ void CpuPassStrategy::EnableMkldnnQuantizer() {
 #ifdef PADDLE_WITH_MKLDNN
   if (!use_mkldnn_quantizer_) {
     passes_.push_back("cpu_quantize_placement_pass");
-    passes_.push_back("conv_int8_scales_pass");
   }
   use_mkldnn_quantizer_ = true;
 #else
