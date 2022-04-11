@@ -14,9 +14,53 @@
 
 #include "paddle/fluid/framework/ir/mkldnn/conv_int8_scales_pass.h"
 
+#include "paddle/fluid/framework/op_version_registry.h"
+#include "paddle/fluid/platform/enforce.h"
+#include "paddle/fluid/platform/mkldnn_helper.h"
+
 namespace paddle {
 namespace framework {
 namespace ir {
+
+ConvInt8ScalesPass::ConvInt8ScalesPass() {
+  AddOpCompat(OpCompat("conv2d"))
+      .AddInput("Input")
+      .IsTensor()
+      .End()
+      .AddInput("Filter")
+      .IsTensor()
+      .End()
+      .AddInput("Bias")
+      .IsTensor()
+      .IsOptional()
+      .End()
+      .AddInput("ResidualData")
+      .IsTensor()
+      .IsOptional()
+      .End()
+      .AddOutput("Output")
+      .IsTensor()
+      .End()
+      .AddAttr("strides")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("paddings")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("padding_algorithm")
+      .IsOptional()
+      .IsStringIn({"EXPLICIT", "SAME", "VALID"})
+      .End()
+      .AddAttr("groups")
+      .IsNumGE(1)
+      .End()
+      .AddAttr("dilations")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("data_format")
+      .IsStringIn({"NCHW", "AnyLayout"})
+      .End();
+}
 
 void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
   PADDLE_ENFORCE_NOT_NULL(graph,
@@ -25,6 +69,7 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
   FusePassBase::Init("conv_int8_scales_pass", graph);
   GraphPatternDetector gpd;
   patterns::Conv conv_pattern(gpd.mutable_pattern(), "conv_int8_scales_pass");
+  conv_pattern();
 
   int found_conv_int8_scales_count = 0;
   auto handler = [&](const GraphPatternDetector::subgraph_t& subgraph,
@@ -34,6 +79,11 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
       return;
     }
     GET_IR_NODE_FROM_SUBGRAPH(conv_op, conv_op, conv_pattern);
+
+    if (!platform::HasOpINT8DataType(conv_op->Op())) {
+      return;
+    }
+
     GET_IR_NODE_FROM_SUBGRAPH(conv_input, conv_input, conv_pattern);
     GET_IR_NODE_FROM_SUBGRAPH(conv_filter, conv_filter, conv_pattern);
     GET_IR_NODE_FROM_SUBGRAPH(conv_output, conv_output, conv_pattern);
@@ -120,3 +170,7 @@ void ConvInt8ScalesPass::ApplyImpl(ir::Graph* graph) const {
 }  // namespace paddle
 
 REGISTER_PASS(conv_int8_scales_pass, paddle::framework::ir::ConvInt8ScalesPass);
+REGISTER_PASS_CAPABILITY(conv_int8_scales_pass)
+    .AddCombination(
+        paddle::framework::compatible::OpVersionComparatorCombination()
+            .LE("conv2d", 1));

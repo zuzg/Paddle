@@ -30,6 +30,7 @@ class Graph;
  */
 class ConvInt8ScalesPass : public FusePassBase {
  public:
+  ConvInt8ScalesPass();
   virtual ~ConvInt8ScalesPass() {}
 
  protected:
