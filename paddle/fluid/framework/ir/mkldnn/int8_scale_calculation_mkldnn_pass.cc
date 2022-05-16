@@ -97,6 +97,8 @@ void Int8ScaleCalculationMkldnnPass::ApplyImpl(ir::Graph* graph) const {
     const int groups =
         std::max(conv_op->Op()->GetAttrIfExists<int>("groups"), 1);
 
+    platform::GetGroupConvWeightsTz(weights_tz, groups);
+
     const auto& scale_weights_data =
         conv_op->Op()->GetAttrIfExists<std::vector<float>>("Scale_weights");
     const auto& scale_in_data =
