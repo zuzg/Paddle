@@ -16,6 +16,7 @@
 #include "paddle/fluid/framework/op_registry.h"
 #include "paddle/fluid/memory/malloc.h"
 #include "paddle/fluid/operators/conv_op.h"
+#include "paddle/fluid/platform/mkldnn_helper.h"
 #include "paddle/fluid/platform/mkldnn_reuse.h"
 
 namespace paddle {
@@ -34,6 +35,26 @@ inline dnnl::memory::dims GetWeightsTz(const Tensor* filter, const int groups) {
   return weights_tz;
 }
 
+static dnnl::memory::data_type GetDstType(bool is_int8,
+                                          bool is_bfloat16,
+                                          bool force_fp32_output,
+                                          std::string fuse_activation) {
+  auto dst_dt = dnnl::memory::data_type::f32;
+  if (is_int8) {
+    dst_dt = (fuse_activation == "relu" || fuse_activation == "relu6")
+                 ? dnnl::memory::data_type::u8
+                 : dnnl::memory::data_type::s8;
+    if (force_fp32_output) {
+      dst_dt = dnnl::memory::data_type::f32;
+    }  
+  } else {
+    if (!force_fp32_output && is_bfloat16) {
+      dst_dt = dnnl::memory::data_type::bf16;
+    }
+  }
+  return dst_dt;
+}
+
 template <typename T, typename K, typename T_out>
 class ConvTransposeMKLDNNHandlerT
     : public platform::MKLDNNHandlerNoCachingT<T, dnnl::deconvolution_forward> {
@@ -47,6 +68,7 @@ class ConvTransposeMKLDNNHandlerT
       : platform::MKLDNNHandlerNoCachingT<T, dnnl::deconvolution_forward>(
             mkldnn_engine, ctx.GetPlace()),
         is_test_(ctx.Attr<bool>("is_test")) {
+
     PADDLE_ENFORCE_EQ(is_test_,
                       true,
                       platform::errors::InvalidArgument(
@@ -123,7 +145,7 @@ class ConvTransposeMKLDNNHandlerT
         phi::slice_ddim(filter_dims, 2, filter_dims.size());
 
     const auto ksize = phi::vectorize(filter_data_dims);
-
+    
     UpdatePaddingAndDilation(
         &paddings, &dilations, padding_algorithm, data_dims, strides, ksize);
 
@@ -148,20 +170,36 @@ class ConvTransposeMKLDNNHandlerT
         std::is_same<T_out, platform::bfloat16>::value)
       data_type = dnnl::memory::data_type::bf16;
 
-    const auto src_md =
-        platform::MKLDNNMemDesc(src_tz, data_type, chosen_memory_format);
-    const auto weights_md =
-        platform::MKLDNNMemDesc(weights_tz, data_type, chosen_memory_format);
+    dnnl::memory::desc src_md, weights_md;
+      if (platform::is_int8<T>()) {
+        src_md = platform::MKLDNNMemDesc(
+            src_tz,
+            framework::ToMKLDNNDataType(
+                framework::TransToProtoVarType(input->dtype())),
+            chosen_memory_format);
+        weights_md = platform::MKLDNNMemDesc(
+            weights_tz, dnnl::memory::data_type::s8, chosen_memory_format);
+      } else {
+        src_md =
+            platform::MKLDNNMemDesc(src_tz, data_type, chosen_memory_format);
+        weights_md = platform::MKLDNNMemDesc(
+            weights_tz, data_type, MKLDNNMemoryFormat::any);
+      }
     const auto dst_md = platform::MKLDNNMemDesc(
         dst_tz, platform::MKLDNNGetDataType<T_out>(), chosen_memory_format);
-
     const dnnl::primitive_attr conv_trans_attr = CreateConvAttrs(ctx);
     auto fwd_prop_kind = is_test_ ? dnnl::prop_kind::forward_inference
                                   : dnnl::prop_kind::forward_training;
     if (bias) {
       std::vector<int64_t> bias_tz = phi::vectorize(bias->dims());
-      const auto bias_md =
-          platform::MKLDNNMemDesc(bias_tz, data_type, MKLDNNMemoryFormat::x);
+      dnnl::memory::desc bias_md;
+      if (platform::is_int8<T>()) {
+        bias_md = platform::MKLDNNMemDesc(
+            bias_tz, dnnl::memory::data_type::s32, MKLDNNMemoryFormat::x);
+      } else {
+        bias_md = platform::MKLDNNMemDesc(
+          bias_tz, data_type, MKLDNNMemoryFormat::x);
+      }
       this->AcquireForwardPrimitiveDescriptor(
           conv_trans_attr,
           fwd_prop_kind,
@@ -189,30 +227,116 @@ class ConvTransposeMKLDNNHandlerT
     }
   }
 
+    std::shared_ptr<std::tuple<float, std::vector<float>>> get_int8_bias_scales(
+      const framework::ExecutionContext& ctx) {
+    // Get scales int8 bias key
+    const std::string key_bs = this->key_ + "@bs";
+
+    // Scales for int8 bias are to be cached to avoid
+    // computing them each iteration
+    auto bias_scale_tuple =
+        std::static_pointer_cast<std::tuple<float, std::vector<float>>>(
+            this->dev_ctx_.GetBlob(key_bs));
+    if (bias_scale_tuple) return bias_scale_tuple;
+
+    const auto* filter = ctx.Input<Tensor>("Filter");
+    const auto& weights_tz = phi::vectorize(filter->dims());
+    const int groups = std::max(ctx.Attr<int>("groups"), 1);
+
+    const auto& scale_weights_data =
+        ctx.Attr<std::vector<float>>("Scale_weights");
+    const auto& scale_in_data = ctx.Attr<float>("Scale_in");
+
+    bool is_multi_channel = scale_weights_data.size() > 1;
+    int mask_reorder = is_multi_channel ? 1 << 0 : 1;
+
+    int count = 1;
+    if (is_multi_channel) {
+      count *= weights_tz[0];
+      if (groups > 1) {
+        count *= weights_tz[1];
+      }
+    }
+
+    bias_scale_tuple =
+        std::make_shared<std::tuple<float, std::vector<float>>>(std::make_tuple(
+            static_cast<float>(mask_reorder), std::vector<float>(count)));
+    for (int i = 0; i < count; i++) {
+      std::get<1>(*bias_scale_tuple)[i] = scale_in_data * scale_weights_data[i];
+    }
+
+    this->dev_ctx_.SetBlob(key_bs, bias_scale_tuple);
+
+    return bias_scale_tuple;
+  }
+
+  std::tuple<float, std::vector<float>, float> get_int8_scales(
+      const framework::ExecutionContext& ctx) const {
+    const auto* filter = ctx.Input<Tensor>("Filter");
+    const auto& weights_tz = phi::vectorize(filter->dims());
+    const bool& force_fp32_output = ctx.Attr<bool>("force_fp32_output");
+    const int groups = std::max(ctx.Attr<int>("groups"), 1);
+ 
+    const auto& scale_in_data = ctx.Attr<float>("Scale_in");
+    auto scale_weights_data = ctx.Attr<std::vector<float>>("Scale_weights");
+    bool is_multi_channel = scale_weights_data.size() > 1;
+    bool has_activation = !ctx.Attr<std::string>("fuse_activation").empty();
+    float activation_scale = (!force_fp32_output && has_activation)
+                                 ? ctx.Attr<float>("Scale_out")
+                                 : 1.0f;
+
+    float scale_out_data = (force_fp32_output || has_activation)
+                               ? 1.0f
+                               : ctx.Attr<float>("Scale_out");
+    float sum_scale = 1.0f;
+    int count =
+        is_multi_channel
+            ? (groups > 1 ? (weights_tz)[1] * (weights_tz)[0] : (weights_tz)[0])
+            : 1;
+    std::vector<float> output_shift_scale(count);
+
+#pragma omp parallel for if (count > 50)
+    for (int i = 0; i < count; i++) {
+      if (scale_weights_data[i] == 0.0)
+        // weights data will contain 0 in some models, then weights
+        // scale couldn't be calculated
+        output_shift_scale[i] = scale_out_data;
+      else
+        output_shift_scale[i] =
+            static_cast<float>(static_cast<double>(scale_out_data) /
+                               (static_cast<double>(scale_in_data) *
+                                static_cast<double>(scale_weights_data[i])));
+    }
+
+    return std::make_tuple(sum_scale, output_shift_scale, activation_scale);
+  }
+
   dnnl::primitive_attr CreateConvAttrs(const framework::ExecutionContext& ctx) {
     dnnl::primitive_attr conv_attr;
     dnnl::post_ops post_operations;
 
-    const std::string fuse_activation =
-        ctx.Attr<std::string>("fuse_activation");
-    const float fuse_alpha = ctx.Attr<float>("fuse_alpha");
-    const float fuse_beta = ctx.Attr<float>("fuse_beta");
+    float sum_scale = 1.0f;
+    float activation_scale = 1.0f;
+    std::vector<float> output_shift_scale;
 
-    // Fusion with ReLU layer is executed through the PostOps feature. Create a
-    // PostOps object and configure it to execute an eltwise relu operation.
-    if (fuse_activation == "relu" || fuse_activation == "leaky_relu") {
-      constexpr float scale = 1.0f;
-      post_operations.append_eltwise(
-          scale, dnnl::algorithm::eltwise_relu, fuse_alpha, fuse_beta);
-    } else if (fuse_activation == "relu6") {
-      constexpr float scale = 1.0f;
-      post_operations.append_eltwise(
-          scale, dnnl::algorithm::eltwise_bounded_relu, fuse_alpha, fuse_beta);
-    } else if (fuse_activation == "swish") {
-      constexpr float scale = 1.0f;
-      post_operations.append_eltwise(
-          scale, dnnl::algorithm::eltwise_swish, fuse_alpha, fuse_beta);
+     if (platform::is_int8<T>()) {
+      if (ctx.HasAttr("Sum_scale")) {
+        sum_scale = ctx.Attr<float>("Sum_scale");
+        activation_scale = ctx.Attr<float>("Activation_scale");
+        output_shift_scale = ctx.Attr<std::vector<float>>("Output_shift_scale");
+      } else {
+        std::tie(sum_scale, output_shift_scale, activation_scale) =
+            get_int8_scales(ctx);
+      }
+
+      if (output_shift_scale.size() > 0) {
+        int mask = output_shift_scale.size() > 1 ? 1 << 1 : 0;
+        conv_attr.set_output_scales(mask, output_shift_scale);
+      }
     }
+
+    platform::AppendActivation(ctx, post_operations, activation_scale);
+
     conv_attr.set_post_ops(post_operations);
     return conv_attr;
   }
@@ -230,7 +354,8 @@ class ConvTransposeMKLDNNHandlerT
       const platform::MKLDNNDeviceContext& dev_ctx,
       const std::string& key,
       const framework::Tensor* filter,
-      const int& groups) {
+      const int& groups,
+      const std::vector<float>& scale_data = {1.0f}) {
     const K* filter_data = filter->data<K>();
     auto weights_tz = GetWeightsTz(filter, groups);
     int g = std::max(groups, 1);
@@ -247,7 +372,8 @@ class ConvTransposeMKLDNNHandlerT
         platform::to_void_cast<K>(filter_data),
         key,
         "@weights_mem_p",
-        is_test_);
+        is_test_,
+        scale_data);
   }
 
   template <typename F = T>
@@ -331,7 +457,8 @@ class ConvTransposeMKLDNNHandlerT
   std::shared_ptr<dnnl::memory> AcquireBiasMemoryWithReorder(
       const platform::MKLDNNDeviceContext& dev_ctx,
       const std::string& key,
-      const framework::Tensor* bias) {
+      const framework::Tensor* bias,
+      const std::vector<float>& scale_data = {1.0f}) {
     const K* bias_data = bias->data<K>();
     auto user_bias_md =
         platform::MKLDNNMemDesc(phi::vectorize(bias->dims()),
@@ -343,7 +470,8 @@ class ConvTransposeMKLDNNHandlerT
                                           platform::to_void_cast<K>(bias_data),
                                           key,
                                           "@bias_mem_p",
-                                          is_test_);
+                                          is_test_,
+                                          scale_data);
   }
 
  private:
@@ -358,21 +486,35 @@ class ConvTransposeMKLDNNOpKernel : public framework::OpKernel<T> {
                       true,
                       platform::errors::PreconditionNotMet(
                           "Operator DNNL ConvTranspose must use CPUPlace"));
-    const bool is_bfloat16 =
+    const bool is_INT8 =
+        std::is_same<T, int8_t>::value || std::is_same<T, uint8_t>::value;
+    const bool is_BFLOAT16 =
         ctx.Attr<std::string>("mkldnn_data_type") == "bfloat16";
+    std::string fuse_activation = ctx.Attr<std::string>("fuse_activation");
     const bool force_fp32_output = ctx.Attr<bool>("force_fp32_output");
-    if (is_bfloat16) {
-      if (force_fp32_output)
-        Execute<float>(ctx);
-      else
-        Execute<platform::bfloat16>(ctx);
+    auto dst_dt = GetDstType(is_INT8,
+                             is_BFLOAT16,
+                             force_fp32_output,
+                             fuse_activation);
+    if (!is_INT8) {
+      if (dst_dt == dnnl::memory::data_type::f32) {
+        ComputeFP32<float>(ctx);
+      } else if (dst_dt == dnnl::memory::data_type::bf16) {
+        ComputeFP32<platform::bfloat16>(ctx);
+      }
     } else {
-      Execute<float>(ctx);
+      if (dst_dt == dnnl::memory::data_type::f32) {
+        ComputeINT8<float>(ctx);
+      } else if (dst_dt == dnnl::memory::data_type::u8) {
+        ComputeINT8<uint8_t>(ctx);
+      } else if (dst_dt == dnnl::memory::data_type::s8) {
+        ComputeINT8<int8_t>(ctx);
+      }
     }
   }
 
   template <typename T_out>
-  void Execute(const framework::ExecutionContext& ctx) const {
+  void ComputeFP32(const framework::ExecutionContext& ctx) const {
     auto& dev_ctx =
         ctx.template device_context<platform::MKLDNNDeviceContext>();
     const auto& mkldnn_engine = dev_ctx.GetEngine();
@@ -393,9 +535,9 @@ class ConvTransposeMKLDNNOpKernel : public framework::OpKernel<T> {
     key = platform::ExtendKeyWithThreadInfoIfNeeded(dev_ctx, key);
     auto weights_memory_p = handler.AcquireWeightsMemoryWithReorder(
         dev_ctx, key, filter, ctx.Attr<int>("groups"));
-
     std::shared_ptr<dnnl::memory> dst_memory_p =
         handler.template AcquireDstMemory<T_out>(output);
+    
     auto conv_p = handler.AcquireForwardPrimitive();
 
     std::unordered_map<int, dnnl::memory> args = {
@@ -413,6 +555,99 @@ class ConvTransposeMKLDNNOpKernel : public framework::OpKernel<T> {
     astream.wait();
     output->set_mem_desc(dst_memory_p->get_desc());
   }
+
+  template <typename T_out>
+  void ComputeINT8(const framework::ExecutionContext& ctx) const {
+    auto& dev_ctx =
+        ctx.template device_context<platform::MKLDNNDeviceContext>();
+    const auto& mkldnn_engine = dev_ctx.GetEngine();
+
+    const std::string& fuse_activation =
+        ctx.Attr<std::string>("fuse_activation");
+    const bool is_conv_transpose_3d = ctx.Attr<std::vector<int>>("strides").size() == 3U;
+
+    bool unsigned_output =
+        (fuse_activation == "relu" || fuse_activation == "relu6");
+    bool need_s8_to_u8 = false;
+
+    PADDLE_ENFORCE_NE(
+        is_conv_transpose_3d,
+        true,
+        platform::errors::Unimplemented(
+            "OneDNN int8 conv_transpose does not support 3D inputs currently"));
+
+    auto* input = ctx.Input<Tensor>("Input");
+    auto* filter = ctx.Input<Tensor>("Filter");
+    auto* bias = ctx.HasInput("Bias") ? ctx.Input<Tensor>("Bias") : nullptr;
+    auto* output = ctx.Output<Tensor>("Output");
+
+    ConvTransposeMKLDNNHandlerT<T, K, T_out> handler(
+        ctx, mkldnn_engine, input, filter, bias, output);
+
+    auto src_memory_p = handler.AcquireSrcMemoryWithReorder(input);
+    // Caching Key for weights is needed
+    std::string key = platform::CreateKey(dev_ctx,
+                                          ctx.InputName("Input"),
+                                          ctx.InputName("Filter"),
+                                          (bias ? ctx.InputName("Bias") : ""));
+    key = platform::ExtendKeyWithThreadInfoIfNeeded(dev_ctx, key);
+
+    const auto& scale_weights_data =
+        ctx.Attr<std::vector<float>>("Scale_weights");
+    const bool is_multi_channel = scale_weights_data.size() > 1;
+    const int& groups = ctx.Attr<int>("groups");
+    int mask_reorder =
+        is_multi_channel ? ((groups != 1) ? (1 << 1) + (1 << 0) : 1 << 0) : 0;
+    auto weights_memory_p = handler.AcquireWeightsMemoryWithReorder(
+        dev_ctx, key, filter, ctx.Attr<int>("groups"));
+
+    std::shared_ptr<dnnl::memory> dst_memory_p = 
+        handler.template AcquireDstMemory<T_out>(output);
+
+    need_s8_to_u8 = (platform::MKLDNNGetDataType<T_out>() ==
+                       dnnl::memory::data_type::s8) &&
+                      unsigned_output;
+    
+    auto conv_p = handler.AcquireForwardPrimitive();
+
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC, *src_memory_p},
+        {DNNL_ARG_WEIGHTS, *weights_memory_p},
+        {DNNL_ARG_DST, *dst_memory_p}};
+
+    if (bias) {
+      PADDLE_ENFORCE_EQ(
+        ctx.HasAttr("Bias_scales"),
+        true,
+        platform::errors::NotFound(
+            "No scales for quantization saved in the attributes"));
+
+      std::vector<float> bias_scales;
+      auto p_scales_tuple =
+          std::make_shared<std::tuple<float, std::vector<float>>>(
+              std::make_tuple(static_cast<float>(mask_reorder), bias_scales));
+
+      bias_scales = ctx.Attr<std::vector<float>>("Bias_scales");
+      p_scales_tuple =
+            std::make_shared<std::tuple<float, std::vector<float>>>(
+                std::make_tuple(static_cast<float>(mask_reorder), bias_scales));
+      auto bias_memory_p =
+          handler.AcquireBiasMemoryWithReorder(dev_ctx, key, bias,
+                                               std::get<1>(*p_scales_tuple));
+      args.insert({DNNL_ARG_BIAS, *bias_memory_p});
+    }
+
+    auto& astream = platform::MKLDNNDeviceContext::tls().get_stream();
+    conv_p->execute(astream, args);
+    astream.wait();
+
+    if (need_s8_to_u8) {
+      output->mutable_data<uint8_t>(ctx.GetPlace());
+    }
+
+    output->set_layout(framework::DataLayout::kMKLDNN);
+    output->set_format(platform::GetMKLDNNFormat(*dst_memory_p));
+  }
 };
 
 }  // namespace operators
@@ -425,4 +660,8 @@ REGISTER_OP_KERNEL(
     MKLDNN,
     ::paddle::platform::CPUPlace,
     ops::ConvTransposeMKLDNNOpKernel<float, float>,
-    ops::ConvTransposeMKLDNNOpKernel<paddle::platform::bfloat16, float>);
+    ops::ConvTransposeMKLDNNOpKernel<paddle::platform::bfloat16, float>,
+    ops::ConvTransposeMKLDNNOpKernel<uint8_t, float>,
+    ops::ConvTransposeMKLDNNOpKernel<uint8_t, int8_t>,
+    ops::ConvTransposeMKLDNNOpKernel<int8_t, float>,
+    ops::ConvTransposeMKLDNNOpKernel<int8_t, int8_t>);

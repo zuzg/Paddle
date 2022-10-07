@@ -70,7 +70,6 @@ class TestConv2DTransposeBF16MKLDNNOp(OpTest):
         self.output_size = None
         self.output_padding = []
         self.data_format = "NCHW"
-        self.pad = [0, 0]
         self.padding_algorithm = "EXPLICIT"
         self.force_fp32_output = False
 

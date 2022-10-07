@@ -36,7 +36,6 @@ class TestConv2DInt8Op(TestConv2DOp):
         self.use_cudnn = False
         self.exhaustive_search = False
         self.use_cuda = False
-        self.use_mkldnn = False
         self.data_format = "NCHW"
         self.mkldnn_data_type = "int8"
         self.weighttype = np.float32

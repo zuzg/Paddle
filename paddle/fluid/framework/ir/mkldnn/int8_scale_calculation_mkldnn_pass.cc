@@ -60,6 +60,47 @@ Int8ScaleCalculationMkldnnPass::Int8ScaleCalculationMkldnnPass() {
       .AddAttr("data_format")
       .IsStringIn({"NCHW", "AnyLayout"})
       .End();
+    AddOpCompat(OpCompat("conv2d_transpose"))
+      .AddInput("Input")
+      .IsTensor()
+      .End()
+      .AddInput("Filter")
+      .IsTensor()
+      .End()
+      .AddInput("Bias")
+      .IsTensor()
+      .IsOptional()
+      .End()
+      .AddOutput("Output")
+      .IsTensor()
+      .End()
+      .AddAttr("output_padding")
+      .IsType<std::vector<int>>()
+      .IsOptional()
+      .End()
+      .AddAttr("output_size")
+      .IsType<std::vector<int>>()
+      .IsOptional()
+      .End()
+      .AddAttr("groups")
+      .IsNumGE(1)
+      .End()
+      .AddAttr("dilations")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("strides")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("paddings")
+      .IsType<std::vector<int>>()
+      .End()
+      .AddAttr("padding_algorithm")
+      .IsOptional()
+      .IsStringIn({"EXPLICIT", "SAME", "VALID"})
+      .End()
+      .AddAttr("data_format")
+      .IsStringIn({"NCHW", "NHWC", "AnyLayout"})
+      .End();
 }
 
 void Int8ScaleCalculationMkldnnPass::ApplyImpl(ir::Graph* graph) const {
@@ -171,5 +212,6 @@ REGISTER_PASS(int8_scale_calculation_mkldnn_pass,
               paddle::framework::ir::Int8ScaleCalculationMkldnnPass);
 REGISTER_PASS_CAPABILITY(int8_scale_calculation_mkldnn_pass)
     .AddCombination(
-        paddle::framework::compatible::OpVersionComparatorCombination().LE(
-            "conv2d", 1));
+        paddle::framework::compatible::OpVersionComparatorCombination()
+        .LE("conv2d", 1)
+        .LE("conv_transpose", 1));
