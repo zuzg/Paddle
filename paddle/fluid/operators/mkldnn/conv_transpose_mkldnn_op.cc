@@ -274,20 +274,21 @@ class ConvTransposeMKLDNNHandlerT
       const framework::ExecutionContext& ctx) const {
     const auto* filter = ctx.Input<Tensor>("Filter");
     const auto& weights_tz = phi::vectorize(filter->dims());
-    const bool& force_fp32_output = ctx.Attr<bool>("force_fp32_output");
+    const bool& force_fp32_output = ctx.HasAttr("force_fp32_output") ? ctx.Attr<bool>("force_fp32_output") : false;
     const int groups = std::max(ctx.Attr<int>("groups"), 1);
- 
-    const auto& scale_in_data = ctx.Attr<float>("Scale_in");
-    auto scale_weights_data = ctx.Attr<std::vector<float>>("Scale_weights");
+
+    const auto& scale_in_data = ctx.HasAttr("Scale_in") ? ctx.Attr<float>("Scale_in") : 1.0f;
+    auto scale_weights_data = ctx.HasAttr("Scale_weights") ? ctx.Attr<std::vector<float>>("Scale_weights") : std::vector<float>(1.0f);
     bool is_multi_channel = scale_weights_data.size() > 1;
+    float scale_out = ctx.HasAttr("Scale_out") ? ctx.Attr<float>("Scale_out") : 1.0f;
     bool has_activation = !ctx.Attr<std::string>("fuse_activation").empty();
     float activation_scale = (!force_fp32_output && has_activation)
-                                 ? ctx.Attr<float>("Scale_out")
+                                 ? scale_out
                                  : 1.0f;
 
     float scale_out_data = (force_fp32_output || has_activation)
                                ? 1.0f
-                               : ctx.Attr<float>("Scale_out");
+                               : scale_out;
     float sum_scale = 1.0f;
     int count =
         is_multi_channel
@@ -592,8 +593,8 @@ class ConvTransposeMKLDNNOpKernel : public framework::OpKernel<T> {
                                           (bias ? ctx.InputName("Bias") : ""));
     key = platform::ExtendKeyWithThreadInfoIfNeeded(dev_ctx, key);
 
-    const auto& scale_weights_data =
-        ctx.Attr<std::vector<float>>("Scale_weights");
+    const auto& scale_weights_data = ctx.HasAttr("Scale_weights") ?
+        ctx.Attr<std::vector<float>>("Scale_weights") : std::vector<float>(1.0f);
     const bool is_multi_channel = scale_weights_data.size() > 1;
     const int& groups = ctx.Attr<int>("groups");
     int mask_reorder =

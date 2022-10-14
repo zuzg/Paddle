@@ -28,9 +28,9 @@ class TestConv2DTransposeInt8MKLDNNOp(TestConv2DTransposeOp):
     def setUp(self):
         self.op_type = "conv2d_transpose"
         self.data_format = "NCHW"
+        self.use_mkldnn = True
         self.mkldnn_data_type = "int8"
         self.weighttype = np.float32
-        self.use_mkldnn = True
         self.is_test = True
         self.padding_algorithm = "EXPLICIT"
         self.init_test_case()
