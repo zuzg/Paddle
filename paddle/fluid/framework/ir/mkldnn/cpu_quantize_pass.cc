@@ -512,7 +512,10 @@ void CPUQuantizePass::QuantizeFc(Graph* graph) const {
     fc->Op()->SetAttr("Scale_weights", filter_scale);
 
     // if quantization scale is missing for output tensor, return fp32 data
-    if (AreScalesPresentForNodes({output})) {
+    if (fc->Op()->GetAttrIfExists<std::string>("fuse_activation") ==
+        "swish") {
+        fc->Op()->SetAttr("force_fp32_output", true);
+    } else if (AreScalesPresentForNodes({output})) {
       bool is_output_unsigned{false};
       auto output_scale = GetScaleValueForNode(output, &is_output_unsigned);
       DequantizeOutput(
