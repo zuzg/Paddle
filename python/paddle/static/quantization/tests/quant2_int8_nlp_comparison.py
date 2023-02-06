@@ -22,9 +22,14 @@ import unittest
 import numpy as np
 
 import paddle
-from paddle.fluid.framework import IrGraph
-from paddle.framework import core
-from paddle.static.quantization import Quant2Int8MkldnnPass
+import paddle.fluid as fluid
+from paddle.fluid.framework import IrGraph # DEL
+from paddle.fluid.contrib.slim.quantization import Quant2Int8MkldnnPass # DEL
+from paddle import fluid
+from paddle.fluid import core # DEL?
+from paddle.fluid.core import AnalysisConfig, create_paddle_predictor
+from paddle.inference import Config, create_predictor
+# from paddle.fluid.core import AnalysisConfig, create_paddle_predictor
 
 paddle.enable_static()
 
@@ -123,6 +128,7 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
                         shape = []
                         for j in range(2):
                             data = data_fields[j].split(':')
+                            # REFACTOR?
                             assert (
                                 len(data) >= 2
                             ), "Size of data in the dataset is less than 2"
@@ -132,7 +138,8 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
                             shape_np = np.array(shape).astype("int64")
                             buffer_i = data[1].split()
                             buffer_np = np.array(buffer_i).astype("int64")
-                            buffer_np.shape = tuple(shape_np)
+                            # buffer_np.shape = tuple(shape_np)
+                            buffer_np = buffer_np.reshape(shape_np)
                             buffers.append(buffer_np)
                         label = labels_lines[i]
                         yield buffers[0], buffers[1], int(label)
@@ -149,6 +156,24 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
                 correct += 1
         return correct
 
+    def set_config(
+        self,
+        model_path,
+        target='quant',
+    ):  
+        config = AnalysisConfig(model_path)
+        config.switch_specify_input_names(True)
+        config.switch_ir_optim(True)
+        config.switch_use_feed_fetch_ops(True)
+        # if target == 'quant':
+        #     config.enable_mkldnn()
+        #     config.enable_quantizer()
+        # config.disable_gpu()
+        # config.enable_mkldnn()
+        # config.disable_mkldnn_fc_passes() 
+        return config
+
+
     def _predict(
         self,
         test_reader=None,
@@ -159,105 +184,112 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
         target='quant',
     ):
         assert target in ['quant', 'int8', 'fp32']
-        place = paddle.CPUPlace()
-        exe = paddle.static.Executor(place)
-        inference_scope = paddle.static.global_scope()
-        with paddle.static.scope_guard(inference_scope):
-            if os.path.exists(os.path.join(model_path, '__model__')):
-                [
-                    inference_program,
-                    feed_target_names,
-                    fetch_targets,
-                ] = paddle.fluid.io.load_inference_model(model_path, exe)
-            else:
-                [
-                    inference_program,
-                    feed_target_names,
-                    fetch_targets,
-                ] = paddle.static.load_inference_model(
-                    model_path,
-                    exe,
-                    model_filename='model',
-                    params_filename='params',
-                )
+        place = fluid.CPUPlace()
+        # exe = fluid.Executor(place)
+        # inference_scope = fluid.executor.global_scope()
+        # with fluid.scope_guard(inference_scope):
+            # if os.path.exists(os.path.join(model_path, '__model__')):
+            #     [
+            #         inference_program,
+            #         feed_target_names,
+            #         fetch_targets,
+            #     ] = fluid.io.load_inference_model(model_path, exe)
+            # else:
+            #     [
+            #         inference_program,
+            #         feed_target_names,
+            #         fetch_targets,
+            #     ] = fluid.io.load_inference_model(
+            #         model_path, exe, 'model', 'params'
+            #     )
 
-            graph = IrGraph(core.Graph(inference_program.desc), for_test=True)
-            if self._debug:
-                graph.draw('.', 'quant_orig', graph.all_op_nodes())
-            if target != 'quant':
-                quant_transform_pass = Quant2Int8MkldnnPass(
-                    self._quantized_ops,
-                    _op_ids_to_skip=self._op_ids_to_skip,
-                    _scope=inference_scope,
-                    _place=place,
-                    _core=core,
-                    _debug=self._debug,
-                )
-                if target == 'int8':
-                    graph = quant_transform_pass.apply(graph)
-                else:  # target == fp32
-                    graph = quant_transform_pass.prepare_and_optimize_fp32(
-                        graph
-                    )
+            # graph = IrGraph(core.Graph(inference_program.desc), for_test=True)
+            # if self._debug:
+            #     graph.draw('.', 'quant_orig', graph.all_op_nodes())
+            # if target != 'quant':
+            #     quant_transform_pass = Quant2Int8MkldnnPass(
+            #         self._quantized_ops,
+            #         _op_ids_to_skip=self._op_ids_to_skip,
+            #         _scope=inference_scope,
+            #         _place=place,
+            #         _core=core,
+            #         _debug=self._debug,
+            #     )
+            #     if target == 'int8':
+            #         graph = quant_transform_pass.apply(graph)
+            #     else:  # target == fp32
+            #         graph = quant_transform_pass.prepare_and_optimize_fp32(
+            #             graph
+            #         )
 
-            inference_program = graph.to_program()
+            # inference_program = graph.to_program()
+        print(f"target: {target}, model path: {model_path}")
 
-            total_correct = 0
-            total_samples = 0
-            batch_times = []
-            ppses = []  # predictions per second
-            iters = 0
-            infer_start_time = time.time()
-            for data in test_reader():
-                if batch_num > 0 and iters >= batch_num:
-                    break
-                if iters == skip_batch_num:
-                    total_samples = 0
-                    infer_start_time = time.time()
-                input0 = np.array([x[0] for x in data]).astype('int64')
-                input1 = np.array([x[1] for x in data]).astype('int64')
-                labels = np.array([x[2] for x in data]).astype('int64')
+        config = self.set_config(
+            model_path,
+            target,
+        )
+        predictor = create_paddle_predictor(config)
 
-                start = time.time()
-                out = exe.run(
-                    inference_program,
-                    feed={
-                        feed_target_names[0]: input0,
-                        feed_target_names[1]: input1,
-                    },
-                    fetch_list=fetch_targets,
-                )
-                batch_time = (time.time() - start) * 1000  # in miliseconds
-                batch_times.append(batch_time)
-                batch_correct = self._get_batch_correct(out, labels)
-                batch_len = len(data)
-                total_samples += batch_len
-                total_correct += batch_correct
-                batch_acc = float(batch_correct) / float(batch_len)
-                pps = batch_len / batch_time * 1000
-                ppses.append(pps)
-                latency = batch_time / batch_len
-                iters += 1
-                appx = ' (warm-up)' if iters <= skip_batch_num else ''
-                _logger.info(
-                    'batch {0}{4}, acc: {1:.4f}, latency: {2:.4f} ms, predictions per sec: {3:.2f}'.format(
-                        iters, batch_acc, latency, pps, appx
-                    )
-                )
+        total_correct = 0
+        total_samples = 0
+        batch_times = []
+        ppses = []  # predictions per second
+        iters = 0
+        infer_start_time = time.time()
+        
+        for data in test_reader():
+            if batch_num > 0 and iters >= batch_num:
+                break
+            if iters == skip_batch_num:
+                total_samples = 0
+                infer_start_time = time.time()
+            # check data
+            input0 = np.array([x[0] for x in data]).astype('int64')
+            input1 = np.array([x[1] for x in data]).astype('int64')
+            labels = np.array([x[2] for x in data]).astype('int64')
 
-            # Postprocess benchmark data
-            infer_total_time = time.time() - infer_start_time
-            batch_latencies = batch_times[skip_batch_num:]
-            batch_latency_avg = np.average(batch_latencies)
-            latency_avg = batch_latency_avg / batch_size
-            ppses = ppses[skip_batch_num:]
-            pps_avg = np.average(ppses)
-            acc_avg = float(np.sum(total_correct)) / float(total_samples)
+            start = time.time()
+            # out = exe.run(
+            #     inference_program,
+            #     feed={
+            #         feed_target_names[0]: input0,
+            #         feed_target_names[1]: input1,
+            #     },
+            #     fetch_list=fetch_targets,
+            # )
+            out = predictor.run([input0])
+            batch_time = (time.time() - start) * 1000  # in miliseconds
+            batch_times.append(batch_time)
+            batch_correct = self._get_batch_correct(out, labels)
+            batch_len = len(data)
+            total_samples += batch_len
+            total_correct += batch_correct
+            batch_acc = float(batch_correct) / float(batch_len)
+            pps = batch_len / batch_time * 1000
+            ppses.append(pps)
+            latency = batch_time / batch_len
+            iters += 1
+            appx = ' (warm-up)' if iters <= skip_batch_num else ''
             _logger.info(
-                'Total inference run time: {:.2f} s'.format(infer_total_time)
+                'batch {0}{4}, acc: {1:.4f}, latency: {2:.4f} ms, predictions per sec: {3:.2f}'.format(
+                    iters, batch_acc, latency, pps, appx
+                )
             )
 
-            return acc_avg, pps_avg, latency_avg
+        # Postprocess benchmark data
+        infer_total_time = time.time() - infer_start_time
+        batch_latencies = batch_times[skip_batch_num:]
+        batch_latency_avg = np.average(batch_latencies)
+        latency_avg = batch_latency_avg / batch_size
+        ppses = ppses[skip_batch_num:]
+        pps_avg = np.average(ppses)
+        acc_avg = float(np.sum(total_correct)) / float(total_samples)
+        _logger.info(
+            'Total inference run time: {:.2f} s'.format(infer_total_time)
+        )
+
+        return acc_avg, pps_avg, latency_avg
 
     def _print_performance(self, title, pps, lat):
         _logger.info(
