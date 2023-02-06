@@ -165,11 +165,10 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
         config.switch_specify_input_names(True)
         config.switch_ir_optim(True)
         config.switch_use_feed_fetch_ops(True)
-        # if target == 'quant':
-        #     config.enable_mkldnn()
-        #     config.enable_quantizer()
-        # config.disable_gpu()
-        # config.enable_mkldnn()
+        if target == 'quant':
+            config.enable_mkldnn()
+            config.enable_quantizer()
+        config.disable_gpu()
         # config.disable_mkldnn_fc_passes() 
         return config
 
