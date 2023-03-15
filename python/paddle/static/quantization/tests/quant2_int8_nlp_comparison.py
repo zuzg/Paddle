@@ -29,6 +29,8 @@ from paddle import fluid
 from paddle.fluid import core # DEL?
 from paddle.fluid.core import AnalysisConfig, create_paddle_predictor
 from paddle.inference import Config, create_predictor
+from paddle.framework import core # DEL?
+
 # from paddle.fluid.core import AnalysisConfig, create_paddle_predictor
 
 paddle.enable_static()
@@ -138,11 +140,20 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
                             shape_np = np.array(shape).astype("int64")
                             buffer_i = data[1].split()
                             buffer_np = np.array(buffer_i).astype("int64")
+                            # infer_data.data = core.PaddleBuf(np.array(minputs)) TODO
                             # buffer_np.shape = tuple(shape_np)
                             buffer_np = buffer_np.reshape(shape_np)
+                            buffer_tensor = core.PaddleTensor()
+                            # buffer_tensor.lod = buffer_np.lod()
+                            buffer_tensor.data = core.PaddleBuf(np.array(buffer_np))
+                            buffer_tensor.dtype = core.PaddleDType.FLOAT32
                             buffers.append(buffer_np)
-                        label = labels_lines[i]
-                        yield buffers[0], buffers[1], int(label)
+                        label_tensor = core.PaddleTensor()
+                        label_tensor.data = core.PaddleBuf(labels_lines[i])
+                        # label.shape = labels_lines[i].shape
+                        label_tensor.dtype = core.PaddleDType.INT32
+                        # label = labels_lines[i]
+                        yield buffers[0], buffers[1], labels_lines[i]
 
         return reader
 
@@ -167,9 +178,9 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
         config.switch_use_feed_fetch_ops(True)
         if target == 'quant':
             config.enable_mkldnn()
-            config.enable_quantizer()
+            config.enable_mkldnn_int8()
         config.disable_gpu()
-        # config.disable_mkldnn_fc_passes() 
+        config.delete_pass("constant_folding_pass")
         return config
 
 
@@ -244,9 +255,18 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
                 total_samples = 0
                 infer_start_time = time.time()
             # check data
-            input0 = np.array([x[0] for x in data]).astype('int64')
-            input1 = np.array([x[1] for x in data]).astype('int64')
-            labels = np.array([x[2] for x in data]).astype('int64')
+            input0 = np.array([x[0] for x in data])
+            input1 = np.array([x[1] for x in data])
+            labels = np.array([x[2] for x in data])
+            print(input0.shape)
+            input = np.append([input0], [input1], axis=0)
+            # input = np.squeeze(input)
+            print("shape: ", input.shape)
+            input_tensor = core.PaddleTensor()
+            input_tensor.data = core.PaddleBuf(np.array(input))
+            input_tensor.shape = input.shape
+            input_tensor.dtype = core.PaddleDType.FLOAT32
+
 
             start = time.time()
             # out = exe.run(
@@ -257,7 +277,8 @@ class QuantInt8NLPComparisonTest(unittest.TestCase):
             #     },
             #     fetch_list=fetch_targets,
             # )
-            out = predictor.run([input0])
+            out = predictor.run([input_tensor])
+            print("out: ", out)
             batch_time = (time.time() - start) * 1000  # in miliseconds
             batch_times.append(batch_time)
             batch_correct = self._get_batch_correct(out, labels)
